@@ -93,6 +93,13 @@ class Kohana_Request_Client_External extends Request_Client {
 		$previous = Request::$current;
 		Request::$current = $request;
 
+		// Resolve the POST fields
+		if ($post = $request->post())
+		{
+			$request->body(http_build_query($post, NULL, '&'))
+				->headers('content-type', 'application/x-www-form-urlencoded');
+		}
+
 		try
 		{
 			// If PECL_HTTP is present, use extension to complete request
@@ -183,21 +190,24 @@ class Kohana_Request_Client_External extends Request_Client {
 	protected function _http_execute(Request $request)
 	{
 		$http_method_mapping = array(
-			Http_Request::GET     => HttpRequest::METH_GET,
-			Http_Request::HEAD    => HttpRequest::METH_HEAD,
-			Http_Request::POST    => HttpRequest::METH_POST,
-			Http_Request::PUT     => HttpRequest::METH_PUT,
-			Http_Request::DELETE  => HttpRequest::METH_DELETE,
-			Http_Request::OPTIONS => HttpRequest::METH_OPTIONS,
-			Http_Request::TRACE   => HttpRequest::METH_TRACE,
-			Http_Request::CONNECT => HttpRequest::METH_CONNECT,
+			HTTP_Request::GET     => HTTPRequest::METH_GET,
+			HTTP_Request::HEAD    => HTTPRequest::METH_HEAD,
+			HTTP_Request::POST    => HTTPRequest::METH_POST,
+			HTTP_Request::PUT     => HTTPRequest::METH_PUT,
+			HTTP_Request::DELETE  => HTTPRequest::METH_DELETE,
+			HTTP_Request::OPTIONS => HTTPRequest::METH_OPTIONS,
+			HTTP_Request::TRACE   => HTTPRequest::METH_TRACE,
+			HTTP_Request::CONNECT => HTTPRequest::METH_CONNECT,
 		);
 
 		// Create an http request object
-		$http_request = new HttpRequest($request->uri(), $http_method_mapping[$request->method()]);
+		$http_request = new HTTPRequest($request->uri(), $http_method_mapping[$request->method()]);
 
-		// Set custom options
-		$http_request->setOptions($this->_options);
+		if ($this->_options)
+		{
+			// Set custom options
+			$http_request->setOptions($this->_options);
+		}
 
 		// Set headers
 		$http_request->setHeaders($request->headers()->getArrayCopy());
@@ -205,22 +215,25 @@ class Kohana_Request_Client_External extends Request_Client {
 		// Set cookies
 		$http_request->setCookies($request->cookie());
 
-		// Set body
+		// Set the body
 		$http_request->setBody($request->body());
+
+		// Set the query
+		$http_request->setQueryData($request->query());
 
 		try
 		{
 			$http_request->send();
 		}
-		catch (HttpRequestException $e)
+		catch (HTTPRequestException $e)
 		{
 			throw new Kohana_Request_Exception($e->getMessage());
 		}
-		catch (HttpMalformedHeaderException $e)
+		catch (HTTPMalformedHeaderException $e)
 		{
 			throw new Kohana_Request_Exception($e->getMessage());
 		}
-		catch (HttpEncodingException $e)
+		catch (HTTPEncodingException $e)
 		{
 			throw new Kohana_Request_Exception($e->getMessage());
 		}
@@ -248,14 +261,27 @@ class Kohana_Request_Client_External extends Request_Client {
 		// Reset the headers
 		Request_Client_External::$_processed_headers = array();
 
-		// Allow custom options to be set
-		$options = $this->_options;
-
 		// Set the request method
 		$options[CURLOPT_CUSTOMREQUEST] = $request->method();
 
-		// Set the request body
+		// Set the request body. This is perfectly legal in CURL even
+		// if using a request other than POST. PUT does support this method
+		// and DOES NOT require writing data to disk before putting it, if
+		// reading the PHP docs you may have got that impression. SdF
 		$options[CURLOPT_POSTFIELDS] = $request->body();
+
+		// Process headers
+		if ($headers = $request->headers())
+		{
+			$http_headers = array();
+
+			foreach ($headers as $key => $value)
+			{
+				$http_headers[] = $key.': '.$value;
+			}
+
+			$options[CURLOPT_HTTPHEADER] = $http_headers;
+		}
 
 		// Process cookies
 		if ($cookies = $request->cookie())
@@ -266,8 +292,18 @@ class Kohana_Request_Client_External extends Request_Client {
 		// The transfer must always be returned
 		$options[CURLOPT_RETURNTRANSFER] = TRUE;
 
+		// Apply any additional options set to Request_Client_External::$_options
+		$options += $this->_options;
+
+		$uri = $request->uri();
+
+		if ($query = $request->query())
+		{
+			$uri .= '?'.http_build_query($query, NULL, '&');
+		}
+
 		// Open a new remote connection
-		$curl = curl_init($request->uri());
+		$curl = curl_init($uri);
 
 		// Set connection options
 		if ( ! curl_setopt_array($curl, $options))
@@ -318,7 +354,7 @@ class Kohana_Request_Client_External extends Request_Client {
 		Request_Client_External::$_processed_headers = array();
 
 		// Calculate stream mode
-		$mode = ($request->method() === Http_Request::GET) ? 'r' : 'r+';
+		$mode = ($request->method() === HTTP_Request::GET) ? 'r' : 'r+';
 
 		// Process cookies
 		if ($cookies = $request->cookie())
@@ -326,12 +362,18 @@ class Kohana_Request_Client_External extends Request_Client {
 			$request->headers('cookie', http_build_query($cookies, NULL, '; '));
 		}
 
+		// Get the message body
+		$body = $request->body();
+
+		// Set the content length
+		$request->headers('content-length', strlen($body));
+
 		// Create the context
 		$options = array(
 			$request->protocol() => array(
 				'method'     => $request->method(),
 				'header'     => (string) $request->headers(),
-				'content'    => $request->body(),
+				'content'    => $body,
 				'user-agent' => 'Kohana Framework '.Kohana::VERSION.' ('.Kohana::CODENAME.')'
 			)
 		);
@@ -341,7 +383,14 @@ class Kohana_Request_Client_External extends Request_Client {
 
 		stream_context_set_option($context, $this->_options);
 
-		$stream = fopen($request->uri(), $mode, FALSE, $context);
+		$uri = $request->uri();
+
+		if ($query = $request->query())
+		{
+			$uri .= '?'.http_build_query($query, NULL, '&');
+		}
+
+		$stream = fopen($uri, $mode, FALSE, $context);
 
 		$meta_data = stream_get_meta_data($stream);
 
